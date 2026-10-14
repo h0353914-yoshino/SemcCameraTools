@@ -1,0 +1,6 @@
+/data/andsf.xml andsf.xml
+/data/andsf.xml_Subscription01 andsf.xml_Subscription01
+/data/ds_andsf_config.txt ds_andsf_config.txt
+/data/ds_andsf_config.txt_Subscription01 ds_andsf_config.txt_Subscription01
+/nv/item_files/ims/ims_operation_mode ims_operation_mode
+/nv/item_files/ims/qp_ims_reg_config_db qp_ims_reg_config_db
