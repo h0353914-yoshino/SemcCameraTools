@@ -2,6 +2,24 @@
 
 適用：701SO（BH904YZF9A），原廠 Sony Android 9（`47.2.D.1.150`，`user/release-keys`），中華電信 SIM（46692）。
 
+> LineageOS 15 上用 CustomizationSelector 的 EFS 模式啟用 VoLTE 的流程與結論，見 [701so_lineageos_volte_efs_app_2026-10-18.md](701so_lineageos_volte_efs_app_2026-10-18.md)。
+
+## 0. 2026-10-18 原廠還原後的測試（最新）
+
+每次測試前先用 diag 唯讀確認是原廠（`/policyman/carrier_policy.xml` 5183 bytes、`ims_operation_mode`=02、`qp_ims_reg_config_db` 為原廠內容、其餘 EFS 檔不存在），寫入後等 65 秒、還原 adb、重開機，再到 設定 → 行動網路 → 進階 觸發註冊。
+
+| 測試 | 寫入的 EFS 檔 | 結果 |
+|---|---|---|
+| T1（10/18 01:21 開機） | 12 檔：policy final701、最小集 6 檔、加回 5 檔 | 使用者確認 VoLTE 出現 |
+| T2（10/18 01:39 開機） | 10 檔：T1 扣掉 `qp_ims_reg_config_db`、`ims_operation_mode` | 開機 24 分鐘後仍無 `APN: ims`（不確定有無點進階） |
+| T3（10/18 02:51 開機） | 11 檔：T1 扣掉 `ims_operation_mode`（留原廠 02） | 開機約 2 分鐘後 `APN: ims` state 2（LTE），使用者確認 VoLTE 出現 |
+
+- T3 的 11 檔清單：policy final701、`andsf.xml`（含 `_Subscription01`）、`ds_andsf_config.txt`（含 `_Subscription01`）、`qp_ims_reg_config_db`、`Profile5`、`Profile8`、`ds_dsd_attach_profile.txt_Subscription01`、`nas_ims_setting_mode`、`nas_operator_plmn_list`。
+- 來源比對：9 檔與 G8342 cht mbn 逐位元相同；`qp_ims_reg_config_db` 與 G8342 cht 的 LTE NV 預載 bin 中的單元 5991 逐位元相同（1024 bytes）；policy 是自己改的版本（cht 原檔 70308 bytes）。
+- **這次的觀察**：`ims_operation_mode` 留原廠 02 也能建立 IMS 承載。與 10/14 的二分法 L 測試（改回 02 ✗）不一致，可能是 modem 基底或其他檔案不同。需要再測。
+- T2 與 T3 之間的唯一差異是 `qp_ims_reg_config_db`。T2 失敗但不確定是否有點進階，所以這個結論還要再確認。
+- 還沒驗證：第二次開機後 IMS 是否仍建立；policy 與 `ims_operation_mode` 在這組合中是否必要。
+
 ## 1. 結果（已確認）
 
 - 使用者確認 VoLTE 可用。
