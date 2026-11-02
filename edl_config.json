@@ -1,0 +1,1 @@
+{"supported_functions": ["program", "configure", "nop", "firmwarewrite", "patch", "setbootablestoragedrive", "ufs", "emmc", "power", "benchmark", "read", "getstorageinfo", "getsha256digest", "erase", "peek", "poke"], "programmer": "F:\\Android\\edl\\prog_ufs_firehose_8998_ddr.elf", "serial": 4294967295}
