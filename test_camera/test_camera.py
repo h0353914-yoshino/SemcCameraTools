@@ -911,8 +911,7 @@ def handle_permission_dialog_11(context):
     client.start_instrumentation_service(background=True)
 
     for _ in range(2):
-        if client.wait_then_click(ui["B_使用期間允許"], raise_on_fail=False):
-            break
+        client.wait_then_click(ui["B_使用期間允許"], raise_on_fail=False)
 
     for key in ["B_允許檔案存取", "B_全部允許"]:
         if client.wait_then_click(ui[key], raise_on_fail=False):
