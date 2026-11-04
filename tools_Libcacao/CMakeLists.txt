@@ -146,7 +146,7 @@ include_directories(
     ${REPO_ROOT}/libimageprocessorjni/include
 
     # cacao@1.0~3.1 / provider@1.0 / device@1.0 hidl-gen 生成標頭（repo 自帶，不需 Soong 樹）
-    ${REPO_ROOT}/interfaces/generated
+    ${TOOLS_LIBCACAO_DIR}/a9_include
 )
 
 # ── HIDL 生成標頭 → LINEAGE_ROOT Soong intermediates ────

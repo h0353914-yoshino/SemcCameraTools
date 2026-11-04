@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -470,29 +471,6 @@ class CameraController:
         self.logger.info("停止相機應用程式...")
         self.adb.shell(f"am force-stop {PACKAGE_NAME}", check=False)
 
-    def check_camera_ui_ready(self, timeout_ms: int = TIMEOUT) -> None:
-        """檢查相機 UI 是否就緒，沒有就拋出 Error"""
-        self.ui.wait_exists("B_模式通用", timeout_ms=timeout_ms)
-        self.ui.wait_exists("B_設定", timeout_ms=timeout_ms)
-
-    def ensure_camera_ui_ready(self, timeout=L_TIMEOUT):
-        """檢查相機 UI 是否就緒，，失敗會重啟相機重試一次"""
-        try:
-            self.check_camera_ui_ready(timeout_ms=timeout)
-        except WaitTargetNotFoundError:
-            self.stop_camera()
-            time.sleep(1)
-            self.launch_camera()
-            return self.check_camera_ui_ready(timeout_ms=timeout)
-
-    def try_check_camera_ui_ready(self, timeout=L_TIMEOUT) -> bool:
-        """檢查相機 UI 是否就緒，並回傳"""
-        try:
-            self.check_camera_ui_ready(timeout_ms=timeout)
-            return True
-        except WaitTargetNotFoundError:
-            return False
-
     def time_to_sec(self, t: str) -> int:
         m, s = map(int, t.split(":"))
         return m * 60 + s
@@ -569,54 +547,82 @@ class CameraController:
             )
         return mode, param
 
+    def check_camera_ui_ready(self, timeout_ms: int = TIMEOUT) -> None:
+        """檢查相機 UI 是否就緒，沒有就拋出 Error"""
+        self.ui.wait_exists("B_模式通用", timeout_ms=timeout_ms)
+        self.ui.wait_exists("B_設定", timeout_ms=timeout_ms)
 
-# ------------------------------------------------------------
-# 失敗後的診斷函式
-# ------------------------------------------------------------
-def check_error_ui(ui, *, timeout_ms=TIMEOUT) -> tuple[str, str] | None:
-    """
-    回傳 (title, message)
-    """
-    state_title = ui.get("STATE_錯誤標題")
-    state_msg = ui.get("STATE_錯誤訊息")
+    def ensure_camera_ui_ready(self, timeout=L_TIMEOUT):
+        """檢查相機 UI 是否就緒，，失敗會重啟相機重試一次"""
+        try:
+            self.check_camera_ui_ready(timeout_ms=timeout)
+        except WaitTargetNotFoundError:
+            self.stop_camera()
+            time.sleep(1)
+            self.launch_camera()
+            self.check_camera_ui_ready(timeout_ms=timeout)
 
-    # 如果 key 不存在，無法檢查錯誤 UI
-    if state_title is None or state_msg is None:
-        return None
+    def try_check_camera_ui_ready(self, timeout=L_TIMEOUT) -> bool:
+        """檢查相機 UI 是否就緒，並回傳"""
+        try:
+            self.check_camera_ui_ready(timeout_ms=timeout)
+            return True
+        except WaitTargetNotFoundError:
+            return False
 
-    if not ui.wait_exists(state_title, timeout_ms=timeout_ms, raise_on_fail=False):
-        return None
+    def check_error_ui(self, *, timeout_ms=TIMEOUT) -> tuple[str, str] | None:
+        """
+        回傳 (title, message)
+        """
+        state_title = self.ui.get("STATE_錯誤標題")
+        state_msg = self.ui.get("STATE_錯誤訊息")
 
-    title = field_by_rid(ui.adb, state_title, Field.TEXT, raise_on_fail=False)
-    msg = field_by_rid(ui.adb, state_msg, Field.TEXT, raise_on_fail=False)
+        # 如果 key 不存在，無法檢查錯誤 UI
+        if state_title is None or state_msg is None:
+            return None
 
-    return title, msg
+        if not self.ui.wait_exists(
+            state_title, timeout_ms=timeout_ms, raise_on_fail=False
+        ):
+            return None
+
+        title = field_by_rid(self.adb, state_title, Field.TEXT, raise_on_fail=False)
+        msg = field_by_rid(self.adb, state_msg, Field.TEXT, raise_on_fail=False)
+
+        return title, msg
+
+    def check_camera_running(self) -> bool:
+        result = self.adb.shell(f"pidof {PACKAGE_NAME}", check=False)
+        return bool(result.stdout and result.stdout.strip())
+
+    def monitor_camera_running(self, stop_event, interval_ms: int = 200) -> None:
+        """監控相機是否閃退，若閃退則拋出 RuntimeError"""
+        while not stop_event.is_set():
+            if not self.check_camera_running():
+                raise RuntimeError("相機閃退")
+            time.sleep(interval_ms / 1000)
 
 
-def check_camera_running(adb: Adb) -> bool:
-    result = adb.shell(f"pidof {PACKAGE_NAME}", check=False)
-    return bool(result.stdout and result.stdout.strip())
-
-
-def check_all(context, *, timeout_ms=TIMEOUT, interval_ms=200):
-    ui = context.resources.ui
+def check_all(context, *, monitor, timeout_ms=TIMEOUT, interval_ms=200):
     camera: CameraController = context.camera
     deadline = time.monotonic() + timeout_ms / 1000
 
-    running = False
+    try:
+        monitor.result()  # 監控期間相機未執行或閃退會在此拋出
+        running = True
+    except Exception:
+        running = False
+
     ui_ok = False
     title = None
     msg = None
 
     while time.monotonic() < deadline:
-        if not running:
-            running = check_camera_running(ui.adb)
-
         if not ui_ok:
             ui_ok = camera.try_check_camera_ui_ready()
 
         if msg is None:
-            err = check_error_ui(ui)
+            err = camera.check_error_ui()
             if err is not None:
                 title, msg = err
 
@@ -1137,6 +1143,13 @@ def run_camera_test_flow(
         """執行一次 mode 測試嘗試。成功回傳 True；判定為過熱、可重試回傳 False；
         其他失敗直接 raise RuntimeError。"""
         label = "儲存" if mode.check_saved else ""  # 有check_saved就=儲存
+        monitor_pool = ThreadPoolExecutor(max_workers=1)
+        stop_monitor = threading.Event()
+        monitor_future = monitor_pool.submit(  # 非同步監控相機是否閃退
+            camera.monitor_camera_running,
+            stop_monitor,
+        )
+        monitor_pool.shutdown(wait=False)  # 不等待，監控結束後執行緒自行退出
         try:
             runner.start_test(test=mode)
 
@@ -1146,6 +1159,8 @@ def run_camera_test_flow(
             else:
                 result = test_ok
             elapsed = time.monotonic() - runner.t_start  # 計算耗時
+            stop_monitor.set()
+            monitor_future.result()  # 相機未執行或閃退會在此拋出
 
             if result:
                 logger.info(f"{label}結果: ✅ (耗時 {elapsed:.2f}s)")
@@ -1153,7 +1168,8 @@ def run_camera_test_flow(
 
             raise RuntimeError(f"{label}結果: ❌")
         except Exception as e:
-            diag = check_all(context)
+            stop_monitor.set()
+            diag = check_all(context, monitor=monitor_future)
 
             if handle_overheat(context, diag["error_msg"], delay=delay):
                 camera.launch_camera()  # 啟動相機
@@ -1179,6 +1195,7 @@ def run_camera_test_flow(
         ui.wait_then_click("B_原型確定", timeout_ms=2000, raise_on_fail=False)
 
     camera.launch_camera()  # 啟動相機
+    camera.ensure_camera_ui_ready()  # 確認相機 UI 就緒，失敗會重啟相機重試一次
 
     if args.clear_data:
         handle_permission_dialog(context)  # 處理權限彈窗
