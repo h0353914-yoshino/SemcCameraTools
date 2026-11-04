@@ -768,8 +768,8 @@ def test_slow_960(context) -> bool:
     logger.info("繼續錄影...")
     context.camera.wait_record_time(target_sec=5)  # 等待錄影至少 5 秒
 
-    logger.info("停止錄影...")
-    ui.click_then_appear("B_960停止錄影", "B_快門通用", timeout_ms=SAVE_TIMEOUT)
+    logger.info("等待停止錄影...")
+    ui.click_then_disappear("B_960停止錄影", "B_快門通用", timeout_ms=SAVE_TIMEOUT)
 
 
 def test_slow_120(context) -> bool:
