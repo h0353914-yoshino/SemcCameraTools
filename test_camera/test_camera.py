@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import logging
 import re
+import signal
 import sys
 import tempfile
 import threading
@@ -229,6 +230,45 @@ class TestConfig:
     interval: float  # 輪與輪之間 delay
 
 
+class CameraCrashedError(RuntimeError):
+    """監控執行緒偵測到相機閃退時，於主執行緒拋出，用來中斷目前流程"""
+
+
+class CrashAbort:  # 相機閃退時立即中斷主執行緒正在執行的流程
+    """監控執行緒偵測到閃退時，以 SIGUSR1 送給主執行緒，
+    由 signal handler 拋出 CameraCrashedError。
+    signal 會打斷主執行緒阻塞中的 adb 呼叫（subprocess）與 time.sleep，
+    不必等 UI 等待逾時才進入錯誤處理。
+
+    handler 只在 with 區塊內（armed）才會拋出，區塊外收到的 signal 一律忽略。
+    必須在主執行緒建立（signal.signal 只能在主執行緒呼叫）。
+    """
+
+    def __init__(self):
+        self._armed = False
+        self._main_ident = threading.main_thread().ident
+        # handler 安裝後不還原，避免離開區塊後才送達的 signal 觸發 SIGUSR1 預設行為（結束行程）
+        signal.signal(signal.SIGUSR1, self._handler)
+
+    def _handler(self, signum, frame):
+        if self._armed:
+            self._armed = False  # 只拋出一次
+            raise CameraCrashedError("相機閃退，中斷目前流程")
+
+    def trigger(self) -> None:
+        """由監控執行緒呼叫，要求主執行緒立即中斷"""
+        if self._armed:
+            signal.pthread_kill(self._main_ident, signal.SIGUSR1)
+
+    def __enter__(self):
+        self._armed = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._armed = False
+        return False
+
+
 class TestContext:  # 負責管理 adb、logger、ui、camera controller 等共用資源
     def __init__(self, adb: Adb, log_dir: Path, config: TestConfig):
         self.adb: Adb = adb
@@ -240,6 +280,7 @@ class TestContext:  # 負責管理 adb、logger、ui、camera controller 等共�
         )
         # 建立測試狀態實例
         self.state: TestState = TestState(self.adb, self.resources.logger)
+        self.crash_abort = CrashAbort()  # 相機閃退時立即中斷目前流程
 
 
 class TestRunner:  # 負責管理測試流程，包含輪數、目前測試、開始/結束測試等
@@ -595,10 +636,14 @@ class CameraController:
         result = self.adb.shell(f"pidof {PACKAGE_NAME}", check=False)
         return bool(result.stdout and result.stdout.strip())
 
-    def monitor_camera_running(self, stop_event, interval_ms: int = 200) -> None:
-        """監控相機是否閃退，若閃退則拋出 RuntimeError"""
+    def monitor_camera_running(
+        self, stop_event, interval_ms: int = 200, on_crash=None
+    ) -> None:
+        """監控相機是否閃退，若閃退則呼叫 on_crash 後拋出 RuntimeError"""
         while not stop_event.is_set():
             if not self.check_camera_running():
+                if on_crash is not None:
+                    on_crash()  # 通知主執行緒立即中斷
                 raise RuntimeError("相機閃退")
             time.sleep(interval_ms / 1000)
 
@@ -1148,16 +1193,19 @@ def run_camera_test_flow(
         monitor_future = monitor_pool.submit(  # 非同步監控相機是否閃退
             camera.monitor_camera_running,
             stop_monitor,
+            on_crash=context.crash_abort.trigger,
         )
         monitor_pool.shutdown(wait=False)  # 不等待，監控結束後執行緒自行退出
         try:
-            runner.start_test(test=mode)
+            # 區塊內相機閃退會立即拋出 CameraCrashedError，略過剩餘流程直接進入 except
+            with context.crash_abort:
+                runner.start_test(test=mode)
 
-            test_ok = mode.func(context)
-            if mode.check_saved:  # photo_settings 模式不測試儲存
-                result = state.wait_for_new_file()
-            else:
-                result = test_ok
+                test_ok = mode.func(context)
+                if mode.check_saved:  # photo_settings 模式不測試儲存
+                    result = state.wait_for_new_file()
+                else:
+                    result = test_ok
             elapsed = time.monotonic() - runner.t_start  # 計算耗時
             stop_monitor.set()
             monitor_future.result()  # 相機未執行或閃退會在此拋出
