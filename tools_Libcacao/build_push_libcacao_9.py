@@ -18,7 +18,7 @@ from tools_Common.push_common import push  # noqa: E402
 from tools_Common.adb import Adb  # noqa: E402
 
 LINEAGE_ROOT = Path.home() / "lineageos"
-PRODUCT_NAME = "poplar_kddi"
+PRODUCT_NAME = "poplar"
 NDK_VERSION = "21.4.7075529"
 NDK_ROOT = Path.home() / "Android" / "Sdk" / "ndk" / NDK_VERSION
 

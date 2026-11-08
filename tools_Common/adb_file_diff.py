@@ -2,8 +2,10 @@ from adb import Adb
 
 # 預設 SO 檔案路徑
 SO = {
-    "system/lib/libcacao_process_ctrl_gateway.so",
-    "system/lib/libcacao_process_ctrl_gateway_real.so",
+    # cacao 的 server 端鏈已全面移到 vendor（stable AIDL），app 端留在 system。
+    "vendor/lib/libcacao_process_ctrl_gateway.so",
+    "vendor/lib/libcacao_service.so",
+    "system/lib64/libcacao_client.so",
 }
 
 

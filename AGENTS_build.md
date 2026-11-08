@@ -47,7 +47,7 @@ export USE_CCACHE=1
 
 # 3.1 全系統編譯指令（正確版）
 
-`lunch` 的 product 是 `lineage_xxxxxxxxx`，release 是 `bp1a`：
+`lunch` 的 product 是 `lineage_xxxxxxxxx`，a15 的 release 一律用 `bp1a`：
 
 ```bash
 . build/envsetup.sh

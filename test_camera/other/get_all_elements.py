@@ -196,9 +196,10 @@ def main():
     )
     parser.add_argument("--save", type=str, default=None, help="將結果儲存為 JSON 檔案")
     parser.add_argument("--quiet", action="store_true", help="不輸出至 console")
+    parser.add_argument("--device","-d", type=str, default=None, help="指定要操作的 Android 裝置序號")
 
     args = parser.parse_args()
-    adb = Adb()
+    adb = Adb(serial=args.device)
 
     if args.with_class:
         elements_info = get_all_elements_with_class(adb)

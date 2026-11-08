@@ -50,7 +50,7 @@ if(NOT DEFINED LINEAGE_ROOT)
     set(LINEAGE_ROOT "$ENV{HOME}/lineageos")
 endif()
 if(NOT DEFINED PRODUCT_NAME)
-    set(PRODUCT_NAME "poplar_kddi")
+    set(PRODUCT_NAME "poplar")
 endif()
 
 set(PRODUCT_OUT "${LINEAGE_ROOT}/out/target/product/${PRODUCT_NAME}")
@@ -59,8 +59,9 @@ set(LIBCACAO_SRC "${TOOLS_LIBCACAO_DIR}/../camera/cacao")
 set(REPO_ROOT "${LIBCACAO_SRC}")  # 相容性：保持與原始 CMakeLists.txt 相同的引用
 
 # ABI 相關路徑
-# 連結庫使用 refs/so_64 / refs/so_32（Android 9 原版 .so），確保與設備 ABI 相容
-# （PRODUCT_OUT 含 Android 14 libs，符號簽名不同，不可用於連結目標）
+# 尚未換成重建版的系統庫使用 refs/so_{32,64}（原版 .so，與設備 ABI 相容）；
+# 已換成重建版的（cacao 系列 HIDL、libcammw_util、libsomc_chokoballpal 等）
+# 直接連結本地編出來的目標，不走 refs。
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     set(SYSTEM_LIB    "${TOOLS_LIBCACAO_DIR}/refs/so_64")
     set(PREBUILTS_LIB "${LIBCACAO_SRC}/prebuilts/lib64")
@@ -145,7 +146,7 @@ include_directories(
     ${REPO_ROOT}/libimageprocessorjni/include
 
     # cacao@1.0~3.1 / provider@1.0 / device@1.0 hidl-gen 生成標頭（repo 自帶，不需 Soong 樹）
-    ${REPO_ROOT}/interfaces/generated
+    ${TOOLS_LIBCACAO_DIR}/a9_include
 )
 
 # ── HIDL 生成標頭 → LINEAGE_ROOT Soong intermediates ────
@@ -237,10 +238,14 @@ function(add_hidl_lib varname filename)
 endfunction()
 
 function(add_vendor_hidl_lib varname filename)
+    set(_VENDOR_HIDL_PATH "")
     if(EXISTS "${PREBUILTS_LIB}/${filename}.so")
+        set(_VENDOR_HIDL_PATH "${PREBUILTS_LIB}/${filename}.so")
+    endif()
+    if(_VENDOR_HIDL_PATH)
         add_library(${varname} SHARED IMPORTED)
         set_target_properties(${varname} PROPERTIES
-            IMPORTED_LOCATION "${PREBUILTS_LIB}/${filename}.so"
+            IMPORTED_LOCATION "${_VENDOR_HIDL_PATH}"
         )
     else()
         # sysroot 模式：無 vendor HIDL 庫，建立虛擬 INTERFACE 庫
@@ -251,7 +256,7 @@ function(add_vendor_hidl_lib varname filename)
     endif()
 endfunction()
 
-# ── 系統庫 (refs/so_{32,64}/) ───────────────────────────
+# ── 系統庫 (refs/so_{32,64}/，僅限未換成重建版的) ───────────────────────────
 # libc++：使用設備原版 libc++.so（std::__1 namespace），與 HIDL 系統庫 ABI 相容
 if(EXISTS "${SYSTEM_LIB}/libc++.so")
     add_library(libcxx_shared SHARED IMPORTED)
@@ -284,9 +289,13 @@ add_hidl_lib(hidl_manager_1_0        "android.hidl.manager@1.0")
 
 # ── vendor 預建庫 (prebuilts/lib{64}/) ───────────────────
 add_prebuilt_lib(libcacao_pal "libcacao_pal")
-add_vendor_hidl_lib(somc_cacao_3_0    "vendor.somc.hardware.camera.cacao@3.0")
-add_vendor_hidl_lib(somc_cacao_3_1    "vendor.somc.hardware.camera.cacao@3.1")
-add_vendor_hidl_lib(somc_provider_1_0 "vendor.somc.hardware.camera.provider@1.0")
+# 這三個 vendor HIDL 庫改指向本地自行編譯的版本（見檔案末端 somc_*_rb 目標）
+add_library(somc_cacao_3_0 INTERFACE)
+target_link_libraries(somc_cacao_3_0 INTERFACE somc_cacao_3_0_rb)
+add_library(somc_cacao_3_1 INTERFACE)
+target_link_libraries(somc_cacao_3_1 INTERFACE somc_cacao_3_1_rb)
+add_library(somc_provider_1_0 INTERFACE)
+target_link_libraries(somc_provider_1_0 INTERFACE somc_provider_1_0_rb)
 
 # ── Android 9 相容性靜態庫 ───────────────────────────────
 # 提供 onValueRetrieval() 的 weak symbol 定義
@@ -556,5 +565,92 @@ if(ANDROID_ABI STREQUAL "armeabi-v7a")
     # CMake 會自動加 lib 前綴，改回原版檔名／SONAME
     set_target_properties(libsomc_chokoballpal PROPERTIES
         OUTPUT_NAME "somc_chokoballpal"
+    )
+
+    # ── libcammw_util（vendor，32-bit；對應 camera/cacao/libcammw_util）──
+    file(GLOB CAMMW_UTIL_SRCS "${REPO_ROOT}/libcammw_util/src/*.cpp")
+    add_library(libcammw_util SHARED ${CAMMW_UTIL_SRCS})
+    target_include_directories(libcammw_util BEFORE PRIVATE ${TOOLS_LIBCACAO_DIR}/a9_include/shim)
+    # CMake 會再加一次 lib 前綴，改回原版檔名 libcammw_util.so
+    set_target_properties(libcammw_util PROPERTIES OUTPUT_NAME "cammw_util")
+    target_include_directories(libcammw_util PRIVATE
+        ${REPO_ROOT}/libcammw_util/include
+        ${LINEAGE_ROOT}/hardware/qcom-caf/msm8998/display/gralloc
+    )
+    target_link_libraries(libcammw_util PRIVATE
+        -Wl,--pack-dyn-relocs=none
+        -Wl,--version-script=${REPO_ROOT}/libcammw_util/cammw_util.map
+        libcxx_shared
+        liblog
+        libcutils
+        libhardware
+    )
+
+    # ── vendor.somc.hardware.camera.* HIDL 介面庫（32-bit；對應 camera/cacao/interfaces）──
+    # 先補齊依賴的 device@1.0 / device@3.2
+    add_hidl_lib(hw_camera_device_1_0 "android.hardware.camera.device@1.0")
+    add_hidl_lib(hw_camera_device_3_2 "android.hardware.camera.device@3.2")
+    add_system_lib(liblog)
+
+    # vendor.somc 介面原始碼與 android/ 的 A9 生成標頭都在 tools_Libcacao/a9_include
+    set(SOMC_HIDL_ROOT ${TOOLS_LIBCACAO_DIR}/a9_include)
+    set(SOMC_HIDL_COMMON_LIBS
+        hidl_base_1_0
+        hidl_manager_1_0
+        libhidlbase
+        libhidltransport
+        liblog
+        libutils
+        libcutils
+        libcxx_shared
+    )
+
+    function(add_somc_hidl_iface target outname)
+        set(_srcs ${ARGN})
+        list(TRANSFORM _srcs PREPEND "${SOMC_HIDL_ROOT}/")
+        add_library(${target} SHARED ${_srcs})
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME "${outname}" PREFIX "")
+        target_include_directories(${target} PUBLIC ${SOMC_HIDL_ROOT})
+        target_compile_options(${target} PRIVATE -Wno-unused-parameter -Wno-unused-variable)
+        # liblog → cutils/trace.h 會引入 C 的 <stdatomic.h>（巨集會打壞 libc++），改用 C++ 替代品
+        target_include_directories(${target} BEFORE PRIVATE ${TOOLS_LIBCACAO_DIR}/a9_include/shim)
+        target_include_directories(${target} BEFORE PRIVATE
+            ${TOOLS_LIBCACAO_DIR}/a9_include/hidl
+            ${TOOLS_LIBCACAO_DIR}/a9_include/libhidl/transport/include
+            ${TOOLS_LIBCACAO_DIR}/a9_include/libhidl/base/include
+            ${TOOLS_LIBCACAO_DIR}/a9_include/libhwbinder/include
+            ${TOOLS_LIBCACAO_DIR}/a9_include/libcutils
+        )
+        target_link_libraries(${target} PRIVATE
+            -Wl,--pack-dyn-relocs=none
+            ${SOMC_HIDL_COMMON_LIBS}
+        )
+    endfunction()
+
+    add_somc_hidl_iface(somc_cacao_1_0_rb "vendor.somc.hardware.camera.cacao@1.0"
+        vendor/somc/hardware/camera/cacao/1.0/CacaoAll.cpp)
+    add_somc_hidl_iface(somc_cacao_2_0_rb "vendor.somc.hardware.camera.cacao@2.0"
+        vendor/somc/hardware/camera/cacao/2.0/CacaoAll.cpp)
+    add_somc_hidl_iface(somc_cacao_3_0_rb "vendor.somc.hardware.camera.cacao@3.0"
+        vendor/somc/hardware/camera/cacao/3.0/types.cpp
+        vendor/somc/hardware/camera/cacao/3.0/CacaoAll.cpp
+        vendor/somc/hardware/camera/cacao/3.0/CacaoCallbackAll.cpp)
+    add_somc_hidl_iface(somc_cacao_3_1_rb "vendor.somc.hardware.camera.cacao@3.1"
+        vendor/somc/hardware/camera/cacao/3.1/types.cpp
+        vendor/somc/hardware/camera/cacao/3.1/CacaoAll.cpp)
+    target_link_libraries(somc_cacao_3_1_rb PRIVATE somc_cacao_3_0_rb)
+    add_somc_hidl_iface(somc_device_1_0_rb "vendor.somc.hardware.camera.device@1.0"
+        vendor/somc/hardware/camera/device/1.0/CameraExtensionDeviceAll.cpp)
+    add_somc_hidl_iface(somc_provider_1_0_rb "vendor.somc.hardware.camera.provider@1.0"
+        vendor/somc/hardware/camera/provider/1.0/VendorSomcCameraProviderAll.cpp)
+    target_link_libraries(somc_provider_1_0_rb PRIVATE
+        hw_camera_common_1_0
+        hw_camera_device_1_0
+        hw_camera_device_3_2
+        hw_camera_provider_2_4
+        somc_cacao_1_0_rb
+        somc_cacao_2_0_rb
+        somc_cacao_3_0_rb
+        somc_device_1_0_rb
     )
 endif()

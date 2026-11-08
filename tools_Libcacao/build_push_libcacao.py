@@ -9,47 +9,109 @@ sys.path.insert(0, str(SEMCCAMERA_ROOT))
 
 
 from tools_Common.parse_args import parse_args  # noqa: E402
-from tools_Common.push_common import copy_compiled_file, push_lib_list  # noqa: E402
+from tools_Common.push_common import copy_compiled_file, push, push_lib_list  # noqa: E402
 from tools_Common.adb import Adb  # noqa: E402
 
 LINEAGE_ROOT = Path.home() / "lineageos"
-LUNCH_TARGET = "lineage_poplardcm-bp1a-userdebug"
-PRODUCT_NAME = "poplardcm"
+LUNCH_TARGET = "lineage_poplar-bp1a-userdebug"
+PRODUCT_NAME = "poplar"
+
+# ── 分割區配置（cacao 已全面移到 vendor，傳輸為 stable AIDL）──
+# system：app 端（libimageprocessorjni 與 libcacao_client 的 core 變體），32/64 位元
+SYSTEM_LIBS = [
+    "libcacao_client",
+    "libimageprocessorjni",
+]
+# vendor：server 端（cacaoserver 鏈，32 位元；libcacao_client/libcacao_pal 的 vendor 變體）
+VENDOR_LIBS = [
+    "libcacao_client",
+    "libcacao_pal",
+    "libcacao_process_ctrl_gateway",
+    "libcacao_service",
+]
+# vendor 的非函式庫檔案：（product out 內相對路徑，裝置路徑，是否為可執行檔）
+VENDOR_FILES = [
+    ("vendor/bin/cacaoserver", "/vendor/bin/cacaoserver", True),
+    ("vendor/etc/init/cacaoserver.rc", "/vendor/etc/init/cacaoserver.rc", False),
+    (
+        "vendor/etc/vintf/manifest/vendor.somc.cacao.xml",
+        "/vendor/etc/vintf/manifest/vendor.somc.cacao.xml",
+        False,
+    ),
+]
 
 # ── Soong 模組名稱（不含 .so） ──
 SOONG_MODULES = [
     "libcacao_client",
+    "libcacao_pal",
     "libcacao_service",
     "libimageprocessorjni",
     "libcacao_process_ctrl_gateway",
+    "cacaoserver",
+    "vendor.somc.cacao.xml",
 ]
 
 
 def push_staged_libs(adb: Adb, out_root: Path) -> None:
-    """推送 staged 的 .so 到設備 /system/lib{,64}/（使用清單批量推送）"""
+    """依 staged 目錄推送：system 函式庫 → /system/lib{,64}，vendor 檔案 → /vendor/..."""
     for arch in ("lib64", "lib"):
-        arch_dir = out_root / arch
-        if not arch_dir.exists():
-            print(f"[WARN] staged {arch} 目錄不存在: {arch_dir}")
-            continue
-        libs = sorted(p for p in arch_dir.glob("*.so") if p.is_file())
+        arch_dir = out_root / "system" / arch
+        libs = sorted(p for p in arch_dir.glob("*.so") if p.is_file()) if arch_dir.exists() else []
         if not libs:
-            print(f"[WARN] staged {arch} 目錄是空的: {arch_dir}")
+            print(f"[WARN] staged system/{arch} 沒有檔案: {arch_dir}")
             continue
-
-        # 使用清單批量推送
-        lib_names = [lib_path.name for lib_path in libs]
-        print(f"[PUSH] 推送 {len(lib_names)} 個檔案到 {arch}")
+        print(f"[PUSH] system/{arch}: {len(libs)} 個檔案")
         try:
             push_lib_list(
-                lib_names,
+                [p.name for p in libs],
                 arch=arch,
                 local_paths=libs,
                 remote_dir=f"/system/{arch}",
                 adb=adb,
             )
         except Exception as exc:
-            print(f"[WARN] 推送失敗: {exc}")
+            print(f"[WARN] system/{arch} 推送失敗: {exc}")
+
+    vendor_lib_dir = out_root / "vendor" / "lib"
+    vlibs = sorted(p for p in vendor_lib_dir.glob("*.so") if p.is_file()) if vendor_lib_dir.exists() else []
+    if vlibs:
+        print(f"[PUSH] vendor/lib: {len(vlibs)} 個檔案")
+        try:
+            push_lib_list(
+                [p.name for p in vlibs],
+                arch="lib",
+                local_paths=vlibs,
+                remote_dir="/vendor/lib",
+                adb=adb,
+            )
+        except Exception as exc:
+            print(f"[WARN] vendor/lib 推送失敗: {exc}")
+    else:
+        print(f"[WARN] staged vendor/lib 沒有檔案: {vendor_lib_dir}")
+
+    for rel, remote, is_exec in VENDOR_FILES:
+        local = out_root / rel
+        if not local.exists():
+            print(f"[WARN] staged 檔案不存在: {local}")
+            continue
+        print(f"[PUSH] {rel} → {remote}")
+        try:
+            push([local], [remote], adb=adb)
+            adb.shell(f"chmod {'755' if is_exec else '644'} {remote}", check=False)
+        except Exception as exc:
+            print(f"[WARN] {remote} 推送失敗: {exc}")
+
+    # 重新標記 SELinux 標籤（cacaoserver 需標成 cacaoserver_exec 才會轉入 cacaoserver 網域）
+    adb.shell(
+        "restorecon -R /vendor/bin/cacaoserver /vendor/lib /vendor/etc/init "
+        "/vendor/etc/vintf /system/lib /system/lib64",
+        check=False,
+    )
+    print(
+        "[INFO] 服務啟動順序：VINTF 片段與 cacaoserver.rc 變更需重開機才生效；"
+        "sepolicy 變更請另外 m selinux_policy，並推送 /vendor/etc/selinux/{precompiled_sepolicy,"
+        "vendor_sepolicy.cil,vendor_file_contexts,vendor_service_contexts} 後重開機。"
+    )
 
 
 def build(paths):
@@ -67,28 +129,33 @@ def build(paths):
 
 
 def copy(paths, out_root):
-
-    # ── 複製 wrapper / _real .so 到 staged 目錄 ──
+    """把 Soong 編譯產出複製到本地 staged 目錄（out/system/、out/vendor/）。"""
+    product_out = paths["product_out"]
 
     if out_root.exists():
         print(f"[INFO] 清除 out 目錄：{out_root}")
         shutil.rmtree(out_root)
-        out_root.mkdir(parents=True, exist_ok=True)
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    for module in SOONG_MODULES:
+    for module in SYSTEM_LIBS:
         so = module + ".so"
-
-        # wrapper 檔案（以及 CUSTOM_COMPILED_REAL 中的 _real 模組）從 Soong 編譯產出複製
-        src_keys = [("sys64", "out64"), ("sys32", "out32")]
-
-        for src_key, out_key in src_keys:
-            src = paths[src_key] / so
+        for arch in ("lib64", "lib"):
+            src = product_out / "system" / arch / so
             if src.exists():
-                copy_compiled_file(src, paths[out_key] / so)
+                copy_compiled_file(src, out_root / "system" / arch / so)
+
+    for module in VENDOR_LIBS:
+        so = module + ".so"
+        src = product_out / "vendor" / "lib" / so
+        if src.exists():
+            copy_compiled_file(src, out_root / "vendor" / "lib" / so)
+
+    for rel, _remote, _is_exec in VENDOR_FILES:
+        src = product_out / rel
+        if src.exists():
+            copy_compiled_file(src, out_root / rel)
 
     print(f"\n[DONE] staged 至 {out_root}")
-    print(f"       64-bit: {paths['out64']}")
-    print(f"       32-bit: {paths['out32']}")
 
 
 def main() -> int:
@@ -102,12 +169,7 @@ def main() -> int:
     out_root = repo_root / "out"
 
     product_out = LINEAGE_ROOT / "out" / "target" / "product" / PRODUCT_NAME
-    paths = {
-        "sys64": product_out / "system" / "lib64",  # Soong 編譯產出 (64-bit)
-        "sys32": product_out / "system" / "lib",  # Soong 編譯產出 (32-bit)
-        "out64": out_root / "lib64",  # 本地 staged 目錄 (64-bit)
-        "out32": out_root / "lib",  # 本地 staged 目錄 (32-bit)
-    }
+    paths = {"product_out": product_out}
 
     if not product_out.exists():
         raise SystemExit(f"[ERR] 找不到 product out：{product_out}")
